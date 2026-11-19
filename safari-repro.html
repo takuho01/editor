@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="ja"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>縦書き改行の比較診断</title>
+<style>
+.editor-scrollport {
+  position: absolute;
+  inset: 0;
+  writing-mode: horizontal-tb;
+  overflow: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.editor-scrollport-vertical { direction: rtl; }
+.editor-scrollport-horizontal { direction: ltr; }
+.editor-scrollport-vertical > .ime-editor {
+  width: max-content;
+  min-width: 100%;
+  height: 100%;
+}
+.editor-scrollport-horizontal > .ime-editor {
+  width: 100%;
+  min-height: 100%;
+  height: auto;
+}
+
+
+*{box-sizing:border-box}body{margin:12px;font:14px system-ui;background:#faf7f0;color:#222}
+button,select{font:inherit;padding:9px;margin:3px 0;max-width:100%}
+p{line-height:1.5;margin:8px 0}#editor{width:100%;height:42dvh;min-height:150px;border:1px solid #aaa;
+ writing-mode:vertical-rl;overflow:auto;font:19px/2 serif;background:white;outline:none}
+#editor.app-style{padding:20px 18px 28px 62px;letter-spacing:.02em;text-orientation:mixed;
+ line-break:strict;overflow-wrap:break-word;overscroll-behavior:contain;
+ -webkit-overflow-scrolling:touch;-webkit-user-select:text;user-select:text;--colw:38px}
+.app-style .ed-block{min-block-size:var(--colw);min-inline-size:1em}
+.ed-comp{text-decoration:underline dotted}#status{font-size:12px}textarea{width:100%;height:100px}
+#scroller:not(.separated){display:contents}
+#scroller.separated{position:relative;inset:auto;width:100%;height:42dvh;min-height:150px;border:1px solid #aaa}
+#scroller.separated > #editor{width:max-content;min-width:100%;height:100%;min-height:0;border:0;overflow:visible;direction:ltr}
+#editor.custom-caret-mode,#editor.custom-caret-mode *{caret-color:transparent !important}
+#custom-caret{display:none;position:absolute;height:2px;background:#0066dd;
+ pointer-events:none;user-select:none;z-index:2}
+</style>
+<h1 style="font-size:20px">縦書き改行の比較診断</h1>
+<p>同じiPhoneのSafariで、各モードの「末尾へ」を押してからキーボードで改行してください。
+画面やカーソルが一瞬逆方向へ飛ぶか比較します。モード変更でサンプルを初期化します。</p>
+<select id="mode" aria-label="比較モード">
+ <option value="custom">E：独自カーソル v4（文字位置対応・青い線）</option>
+ <option value="separated">D：今回の修正（スクロールを外側に分離）</option>
+ <option value="app">A：分離前のEditorView＋本文のCSS</option>
+ <option value="native">B：入力処理なし＋同じCSS</option>
+ <option value="minimal">C：入力処理なし＋最小限のCSS</option>
+</select>
+<button id="end">末尾へ</button>
+<label><input id="record" type="checkbox">イベント記録（必要なときだけ）</label>
+<div id="scroller"><div id="editor" contenteditable="true" spellcheck="false" role="textbox" aria-label="比較用本文" aria-multiline="true"></div><span id="custom-caret" aria-hidden="true"></span></div>
+<p id="status"></p>
+<p>Aだけで発生：編集処理が候補。A・Bで発生：CSSが候補。Cでも発生：最小構成でも再現。
+このページには元アプリのヘッダー・自動保存・React・ホスト画面は含まれません。</p>
+<p>Dで今回の構造変更を確認できます。A〜Cは分離前の比較用として残しています。</p>
+<p>EはDと同じ入力処理で、標準カーソルを透明にして青い線を描きます。
+青い線が安定するか、標準の線がまだ見えるか確認してください。選択範囲があるときや本文からフォーカスが外れたときは青い線を隠します。</p>
+<p>記録には選択位置、座標、要素構造、ブラウザ情報を含めます。本文文字列は含めません。
+記録でタイミングが変わる可能性があるため、まず記録なしで試してください。</p>
+<button id="export">診断ログを表示</button><button id="clear">記録をクリア</button>
+<textarea id="log" readonly aria-label="診断ログ" placeholder="ここに表示したログをコピーできます"></textarea>
+<script>
+                                                 
+
+class EditorView {
+          dom                ;
+          text        ;
+          onCommit                        ;
+          disposers                    = [];
+  composing = false;
+          compBlock = -1;
+          compStart = 0;
+  /* The last structural edit applied by the model itself (boundary
+     Backspace / Delete). If the browser then performs the same edit
+     on the DOM anyway, handleInput recognises the derived text as
+     that edit applied twice and restores the model state instead of
+     adopting the duplicate. */
+          lastOwnEdit                                         = null;
+          undoStack              = [];
+          redoStack              = [];
+
+  constructor(dom                , initial        , onCommit                        ) {
+    this.dom = dom;
+    this.text = initial;
+    this.onCommit = onCommit;
+    this.renderAll();
+    const add = (type        , fn               ) => {
+      dom.addEventListener(type, fn);
+      this.disposers.push(() => dom.removeEventListener(type, fn));
+    };
+    add("compositionstart", this.handleCompStart                 );
+    add("compositionend", this.handleCompEnd                 );
+    add("input", this.handleInput                 );
+    add("keydown", this.handleKeyDown                 );
+    add("beforeinput", this.handleBeforeInput                 );
+    add("paste", this.handlePaste                 );
+  }
+
+  destroy() {
+    this.disposers.forEach((d) => d());
+    this.disposers = [];
+  }
+
+  getText() {
+    return this.text;
+  }
+
+  isComposing() {
+    return this.composing;
+  }
+
+  focus() {
+    this.dom.focus();
+  }
+
+          get blocks()           {
+    return this.text.split("\n");
+  }
+
+          blockEl(index        )                          {
+    return this.dom.children[index]                           ;
+  }
+
+          buildBlock(text        , index        )                 {
+    const div = document.createElement("div");
+    div.className = "ed-block";
+    div.dataset.block = String(index);
+    this.renderBlockContent(div, text);
+    return div;
+  }
+
+          renderBlockContent(el             , text        ) {
+    el.innerHTML = "";
+    const span = document.createElement("span");
+    span.className = "ed-seg";
+    if (text === "") span.appendChild(document.createElement("br"));
+    else span.textContent = text;
+    el.appendChild(span);
+  }
+
+          renderAll(caretGlobal         ) {
+    const blocks = this.blocks;
+    this.dom.innerHTML = "";
+    blocks.forEach((b, i) => this.dom.appendChild(this.buildBlock(b, i)));
+    if (caretGlobal !== undefined) this.setCaretGlobal(caretGlobal);
+  }
+
+  /** Apply a model change by patching only the blocks that differ.
+   *  Blocks before and after the changed range keep their existing DOM
+   *  nodes, so the caret, the scroll position and the surrounding layout
+   *  stay put. A full renderAll() here is what made the caret visibly
+   *  flap on every Enter: the whole surface was torn down and rebuilt.
+   *  Callers must invoke this while the DOM still mirrors the old model
+   *  (i.e. edits we make ourselves, never after a browser mutation). */
+          applyEdit(newText        , caret        ) {
+    const oldBlocks = this.blocks;
+    const newBlocks = newText.split("\n");
+    if (this.dom.childNodes.length !== oldBlocks.length) {
+      this.text = newText;
+      this.renderAll(caret);
+      return;
+    }
+    let pre = 0;
+    while (pre < oldBlocks.length && pre < newBlocks.length && oldBlocks[pre] === newBlocks[pre]) pre++;
+    let suf = 0;
+    while (
+      suf < oldBlocks.length - pre &&
+      suf < newBlocks.length - pre &&
+      oldBlocks[oldBlocks.length - 1 - suf] === newBlocks[newBlocks.length - 1 - suf]
+    ) suf++;
+    const oldMidEnd = oldBlocks.length - suf;
+    for (let i = oldMidEnd - 1; i >= pre; i--) this.dom.childNodes[i]?.remove();
+    const ref = this.dom.childNodes[pre] ?? null;
+    for (let k = pre; k < newBlocks.length - suf; k++) {
+      this.dom.insertBefore(this.buildBlock(newBlocks[k] ?? "", k), ref);
+    }
+    Array.from(this.dom.children).forEach((c, i) => {
+      (c               ).dataset.block = String(i);
+    });
+    this.text = newText;
+    this.setCaretGlobal(Math.max(0, Math.min(caret, newText.length)));
+  }
+
+  /** Restore the DOM to the current model after the browser applied an
+   *  edit we had already applied ourselves, patching only the blocks
+   *  that differ from the model. A full renderAll() here was itself a
+   *  visible flash: every block node was torn down and rebuilt just to
+   *  undo a single duplicated edit. */
+          patchToModel(caret        ) {
+    const domBlocks = this.deriveFromDom();
+    const modelBlocks = this.blocks;
+    if (this.dom.childNodes.length !== domBlocks.length) {
+      this.renderAll(caret);
+      return;
+    }
+    let pre = 0;
+    while (pre < domBlocks.length && pre < modelBlocks.length && domBlocks[pre] === modelBlocks[pre]) pre++;
+    let suf = 0;
+    while (
+      suf < domBlocks.length - pre &&
+      suf < modelBlocks.length - pre &&
+      domBlocks[domBlocks.length - 1 - suf] === modelBlocks[modelBlocks.length - 1 - suf]
+    ) suf++;
+    const domMidEnd = domBlocks.length - suf;
+    for (let i = domMidEnd - 1; i >= pre; i--) this.dom.childNodes[i]?.remove();
+    const ref = this.dom.childNodes[pre] ?? null;
+    for (let k = pre; k < modelBlocks.length - suf; k++) {
+      this.dom.insertBefore(this.buildBlock(modelBlocks[k] ?? "", k), ref);
+    }
+    Array.from(this.dom.children).forEach((c, i) => {
+      (c               ).dataset.block = String(i);
+    });
+    this.setCaretGlobal(Math.max(0, Math.min(caret, this.text.length)));
+  }
+
+  /** Text of one block element, excluding any in-progress composition span. */
+          readBlockText(el             )         {
+    let out = "";
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let n             ;
+    while ((n = walker.nextNode())) {
+      const p = n.parentNode                      ;
+      if (p?.classList?.contains("ed-comp")) continue;
+      out += n.textContent ?? "";
+    }
+    return out;
+  }
+
+  /** Re-derive the block list from the live DOM (after browser editing). */
+          deriveFromDom()           {
+    const out           = [];
+    this.dom.childNodes.forEach((n) => {
+      if (n.nodeType === Node.ELEMENT_NODE) out.push(this.readBlockText(n               ));
+      else if (n.nodeType === Node.TEXT_NODE && n.textContent) out.push(n.textContent);
+    });
+    return out.length ? out : [""];
+  }
+
+          offsetInBlock(blockEl             , node      , offset        )         {
+    try {
+      const range = document.createRange();
+      range.setStart(blockEl, 0);
+      range.setEnd(node, offset);
+      return range.toString().length;
+    } catch {
+      return 0;
+    }
+  }
+
+          globalFromNode(node      , offset        )                {
+    let blockNode              = node;
+    while (blockNode && blockNode.parentNode !== this.dom) blockNode = blockNode.parentNode;
+    if (!blockNode) return null;
+    let total = 0;
+    const children = Array.from(this.dom.childNodes);
+    for (const child of children) {
+      if (child === blockNode) {
+        if (child.nodeType === Node.TEXT_NODE) return total + offset;
+        return total + this.offsetInBlock(child               , node, offset);
+      }
+      if (child.nodeType === Node.ELEMENT_NODE) total += this.readBlockText(child               ).length + 1;
+      else if (child.nodeType === Node.TEXT_NODE) total += (child.textContent ?? "").length + 1;
+    }
+    return null;
+  }
+
+          selectionGlobal(which                    )                {
+    const sel = window.getSelection();
+    if (!sel) return null;
+    const node = which === "anchor" ? sel.anchorNode : sel.focusNode;
+    const offset = which === "anchor" ? sel.anchorOffset : sel.focusOffset;
+    if (!node || !this.dom.contains(node)) return null;
+    return this.globalFromNode(node, offset);
+  }
+
+          selectionRangeGlobal()                                        {
+    const a = this.selectionGlobal("anchor");
+    const f = this.selectionGlobal("focus");
+    if (a === null || f === null) return null;
+    return { start: Math.min(a, f), end: Math.max(a, f) };
+  }
+
+          blockOffsetFromGlobal(g        )                                    {
+    const blocks = this.blocks;
+    let idx = 0;
+    let rest = g;
+    while (idx < blocks.length - 1 && rest > (blocks[idx]?.length ?? 0)) {
+      rest -= (blocks[idx]?.length ?? 0) + 1;
+      idx++;
+    }
+    return { block: idx, offset: rest };
+  }
+
+          locate(g        )                                 {
+    const { block, offset } = this.blockOffsetFromGlobal(g);
+    const el = this.blockEl(block) ?? this.dom;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let cur             ;
+    let last              = null;
+    let rem = offset;
+    while ((cur = walker.nextNode())) {
+      const t = cur        ;
+      last = t;
+      if (rem <= t.length) return { node: t, offset: rem };
+      rem -= t.length;
+    }
+    if (last) return { node: last, offset: last.length };
+    return { node: el, offset: 0 };
+  }
+
+          setCaretGlobal(g        ) {
+    const sel = window.getSelection();
+    if (!sel) return;
+    const { node, offset } = this.locate(Math.max(0, Math.min(g, this.text.length)));
+    const range = document.createRange();
+    range.setStart(node, offset);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
+          setSelectionGlobal(start        , end        ) {
+    const sel = window.getSelection();
+    if (!sel) return;
+    const s = this.locate(start);
+    const e = this.locate(end);
+    const range = document.createRange();
+    range.setStart(s.node, s.offset);
+    range.setEnd(e.node, e.offset);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
+          pushUndo(caret               ) {
+    this.undoStack.push({ text: this.text, caret: caret ?? this.text.length });
+    if (this.undoStack.length > 100) this.undoStack.shift();
+    this.redoStack = [];
+  }
+
+  undo() {
+    if (this.composing) return;
+    this.lastOwnEdit = null;
+    const prev = this.undoStack.pop();
+    if (!prev) return;
+    const cur = this.selectionGlobal("anchor");
+    this.redoStack.push({ text: this.text, caret: cur ?? this.text.length });
+    this.dom.focus();
+    this.applyEdit(prev.text, Math.min(prev.caret, prev.text.length));
+    this.onCommit(this.text);
+  }
+
+  redo() {
+    if (this.composing) return;
+    this.lastOwnEdit = null;
+    const next = this.redoStack.pop();
+    if (!next) return;
+    const cur = this.selectionGlobal("anchor");
+    this.undoStack.push({ text: this.text, caret: cur ?? this.text.length });
+    this.dom.focus();
+    this.applyEdit(next.text, Math.min(next.caret, next.text.length));
+    this.onCommit(this.text);
+  }
+
+  insertText(text        ) {
+    if (this.composing) return;
+    this.lastOwnEdit = null;
+    const range = this.selectionRangeGlobal();
+    const start = range?.start ?? this.text.length;
+    const end = range?.end ?? this.text.length;
+    this.pushUndo(start);
+    const newText = this.text.slice(0, start) + text + this.text.slice(end);
+    this.applyEdit(newText, start + text.length);
+    this.dom.focus();
+    this.onCommit(this.text);
+  }
+
+  wrapSelection(open        , close        ) {
+    if (this.composing) return;
+    this.lastOwnEdit = null;
+    const range = this.selectionRangeGlobal();
+    const start = range?.start ?? this.text.length;
+    const end = range?.end ?? this.text.length;
+    const selected = this.text.slice(start, end);
+    this.pushUndo(start);
+    const newText = this.text.slice(0, start) + open + selected + close + this.text.slice(end);
+    this.applyEdit(newText, start + open.length);
+    this.dom.focus();
+    if (selected) this.setSelectionGlobal(start + open.length, start + open.length + selected.length);
+    this.onCommit(this.text);
+  }
+
+  /* ---- event handlers ---- */
+
+          handleCompStart = () => {
+    this.composing = true;
+    this.lastOwnEdit = null;
+    // If text is selected, the composition replaces it: remove it from the
+    // model first so prefix/suffix splitting below is exact.
+    const range = this.selectionRangeGlobal();
+    if (range && range.end > range.start) {
+      this.text = this.text.slice(0, range.start) + this.text.slice(range.end);
+      this.renderAll(range.start);
+    }
+    const g = this.selectionGlobal("anchor");
+    const pos = g !== null ? this.blockOffsetFromGlobal(g) : { block: 0, offset: 0 };
+    this.compBlock = pos.block;
+    this.compStart = pos.offset;
+    const el = this.blockEl(this.compBlock);
+    if (!el) return;
+    const blockText = this.blocks[this.compBlock] ?? "";
+    el.innerHTML = "";
+    const pre = document.createElement("span");
+    pre.className = "ed-seg";
+    const preText = blockText.slice(0, this.compStart);
+    if (preText) pre.textContent = preText;
+    const comp = document.createElement("span");
+    comp.className = "ed-seg ed-comp";
+    const compNode = document.createTextNode("");
+    comp.appendChild(compNode);
+    const suf = document.createElement("span");
+    suf.className = "ed-seg";
+    const sufText = blockText.slice(this.compStart);
+    if (sufText) suf.textContent = sufText;
+    el.append(pre, comp, suf);
+    // Park the caret inside the composition span; the IME writes there and
+    // nothing else touches the DOM until compositionend.
+    const sel = window.getSelection();
+    if (sel) {
+      const r = document.createRange();
+      r.setStart(compNode, 0);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+  };
+
+          handleCompEnd = () => {
+    this.composing = false;
+    const el = this.compBlock >= 0 ? this.blockEl(this.compBlock) : undefined;
+    if (!el) {
+      const derived = this.deriveFromDom();
+      const nt = derived.join("\n");
+      if (nt !== this.text) {
+        this.pushUndo(null);
+        this.text = nt;
+        this.renderAll();
+        this.onCommit(nt);
+      }
+      this.compBlock = -1;
+      return;
+    }
+    let full = "";
+    el.childNodes.forEach((n) => { full += n.textContent ?? ""; });
+    const blocks = this.blocks;
+    const oldBlock = blocks[this.compBlock] ?? "";
+    const inserted = full.length - oldBlock.length;
+    this.pushUndo(null);
+    blocks[this.compBlock] = full;
+    this.text = blocks.join("\n");
+    this.renderBlockContent(el, full);
+    let g = 0;
+    for (let i = 0; i < this.compBlock; i++) g += (blocks[i]?.length ?? 0) + 1;
+    g += this.compStart + Math.max(0, inserted);
+    this.setCaretGlobal(g);
+    this.compBlock = -1;
+    this.onCommit(this.text);
+    // A trailing "input" event may follow; handleInput derives the same
+    // text and becomes a no-op.
+  };
+
+          handleInput = (e       ) => {
+    // Never react mid-composition: the IME owns the DOM until it commits.
+    if (this.composing || (e              ).isComposing) return;
+    const newText = this.deriveFromDom().join("\n");
+    // Browser echo of our own structural edit: we canceled the event
+    // and already applied the edit to the model, but the browser
+    // performed it on the DOM anyway, so the derived text is the model
+    // with the same edit applied a second time at the caret — one more
+    // character removed before/after the caret. Adopting it would eat
+    // a character; patch the DOM back to the model state instead.
+    if (this.lastOwnEdit && newText !== this.text) {
+      const model = this.text;
+      const caret = this.lastOwnEdit.caret;
+      const echo =
+        newText === model.slice(0, caret) + "\n" + model.slice(caret) ||
+        newText === model.slice(0, caret) + model.slice(caret + 1) ||
+        (caret > 0 && newText === model.slice(0, caret - 1) + model.slice(caret));
+      this.lastOwnEdit = null;
+      if (echo) {
+        this.patchToModel(caret);
+        return;
+      }
+    }
+    if (newText === this.text) return;
+    // Adopt the browser's edit as-is. This is also the Enter path: the
+    // browser split the block itself and its caret already sits at the
+    // start of the new block — exactly the target. Writing anything
+    // back here (rewriting the edited block, re-setting the same
+    // caret, rebuilding blocks) is what used to make the caret jump
+    // one line too far and snap back, so the model simply follows.
+    const caret = this.selectionGlobal("anchor");
+    this.pushUndo(caret);
+    this.text = newText;
+    // Keep the browser's scroll position as well as its selection.
+    // Do not restore pre-edit offsets or pin later native caret reveals.
+    this.onCommit(newText);
+  };
+
+          handleKeyDown = (e               ) => {
+    // Let the IME handle every key while composing (Enter confirms, etc.).
+    if (this.composing || e.isComposing) return;
+    // A fresh keystroke supersedes the echo guard left by the previous
+    // structural edit; the structural branches below set it again.
+    if (e.key !== "Enter") this.lastOwnEdit = null;
+    if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+      const k = e.key.toLowerCase();
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); this.undo(); }
+      else if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); this.redo(); }
+      return;
+    }
+    // Enter is intentionally left to the browser: its native split is
+    // adopted in handleInput without any DOM or selection writes.
+    // Intercepting it here and canceling the browser's own edit is
+    // what produced the caret overshoot on iOS Safari, which applies
+    // its insertParagraph even when the keystroke was canceled.
+    // Block-boundary Backspace/Delete merges, on the other hand, are
+    // applied by the model so the two blocks are patched in place.
+    if (e.key === "Backspace" || e.key === "Delete") {
+      const range = this.selectionRangeGlobal();
+      if (range && range.start === range.end) {
+        const pos = range.start;
+        const { block, offset } = this.blockOffsetFromGlobal(pos);
+        const blocks = this.blocks;
+        if (e.key === "Backspace" && offset === 0 && block > 0) {
+          e.preventDefault();
+          this.pushUndo(pos);
+          this.applyEdit(this.text.slice(0, pos - 1) + this.text.slice(pos), pos - 1);
+          this.lastOwnEdit = { text: this.text, caret: pos - 1 };
+          this.onCommit(this.text);
+        } else if (
+          e.key === "Delete" &&
+          block < blocks.length - 1 &&
+          offset === (blocks[block]?.length ?? 0)
+        ) {
+          e.preventDefault();
+          this.pushUndo(pos);
+          this.applyEdit(this.text.slice(0, pos) + this.text.slice(pos + 1), pos);
+          this.lastOwnEdit = { text: this.text, caret: pos };
+          this.onCommit(this.text);
+        }
+      }
+    }
+  };
+
+          handleBeforeInput = (e            ) => {
+    if (this.composing || e.isComposing) return;
+    if (e.inputType === "insertParagraph" || e.inputType === "insertLineBreak") {
+      // A genuine Enter — including from mobile keyboards that deliver
+      // it only as a beforeinput, with no usable keydown. Let the
+      // browser perform the split; handleInput adopts the result and
+      // the caret never leaves the position the browser put it in.
+      // Canceling here is what iOS Safari overrode, applying its own
+      // split on top of ours and sending the caret one line too far.
+      // The pending echo guard belongs to an earlier keystroke and
+      // must not mistake this genuine newline for a duplicate.
+      this.lastOwnEdit = null;
+      return;
+    }
+    // Any other genuine input supersedes the structural-edit echo guard.
+    this.lastOwnEdit = null;
+  };
+
+          handlePaste = (e                ) => {
+    if (this.composing) return;
+    e.preventDefault();
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (text) this.insertText(text);
+  };
+}
+
+
+const el=document.querySelector('#editor'),mode=document.querySelector('#mode');
+const customCaret=document.querySelector('#custom-caret'),scrollport=document.querySelector('#scroller');
+let caretFrame=0;
+function separated(){return mode.value==='separated'||mode.value==='custom';}
+function caretFromText(range,fs){
+ let block=range.startContainer;
+ let atEnd=false;
+ if(block===el){atEnd=range.startOffset===el.childNodes.length;
+  block=el.childNodes[Math.min(range.startOffset,el.childNodes.length-1)];}
+ while(block&&block.parentNode!==el)block=block.parentNode;
+ if(!block||block.nodeType!==Node.ELEMENT_NODE)return null;
+ const text=block.textContent;
+ if(!text.length){const r=block.getBoundingClientRect();
+  return {x:r.left+(r.width-fs)/2,y:r.top,w:fs,source:'empty-block'};}
+ // Translate an element/text Selection boundary into this paragraph's
+ // text offset without inserting markers into the editable DOM.
+ let offset=atEnd?text.length:0;
+ if(range.startContainer!==el){const prefix=document.createRange();prefix.selectNodeContents(block);
+  prefix.setEnd(range.startContainer,range.startOffset);offset=prefix.toString().length;}
+ const segments=typeof Intl.Segmenter==='function'
+  ? Array.from(new Intl.Segmenter('ja',{granularity:'grapheme'}).segment(text),s=>({start:s.index,end:s.index+s.segment.length}))
+  : Array.from(text).reduce((a,c)=>{const start=a.length?a[a.length-1].end:0;a.push({start,end:start+c.length});return a;},[]);
+ // Prefer the following glyph at a wrap boundary: it is in the column
+ // where subsequent input will appear. At paragraph end use the last glyph.
+ const next=segments.find(s=>s.end>offset);
+ const segment=next||segments[segments.length-1];
+ const nodes=[];const walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
+ let node;while((node=walker.nextNode()))nodes.push(node);
+ function locate(pos){for(const n of nodes){if(pos<=n.length)return {node:n,offset:pos};pos-=n.length;}
+  return {node:nodes[nodes.length-1],offset:nodes[nodes.length-1].length};}
+ const start=locate(segment.start),end=locate(segment.end),probe=document.createRange();
+ probe.setStart(start.node,start.offset);probe.setEnd(end.node,end.offset);
+ const rects=Array.from(probe.getClientRects()).filter(r=>r.width>0&&r.height>0);
+ const r=next?rects[0]:rects[rects.length-1];
+ return r?{x:r.left,y:next?r.top:r.bottom,w:r.width,source:'adjacent-glyph'}:null;
+}
+// This marker changes neither Selection nor the editable DOM. It samples
+// the web content's geometry independently of the native iOS caret view.
+function drawCaret(){
+ customCaret.style.display='none';
+ if(mode.value!=='custom'||document.activeElement!==el)return;
+ const sel=getSelection();
+ if(!sel||!sel.isCollapsed||!sel.rangeCount)return;
+ const range=sel.getRangeAt(0);
+ if(!el.contains(range.startContainer))return;
+ const fs=parseFloat(getComputedStyle(el).fontSize);
+ const r=range.getBoundingClientRect();
+ // A vertical-writing caret must have horizontal extent. Some engines
+ // return zero width (including a nonzero height), not just a zero rect.
+ const geometry=r.width>0&&r.height<=3
+  ? {x:r.left,y:r.top,w:r.width,source:'collapsed-range'}:caretFromText(range,fs);
+ if(!geometry)return;
+ const {x,y,w}=geometry;
+ customCaret.dataset.geometry=geometry.source;
+ if(!Number.isFinite(x)||!Number.isFinite(y)||w<=0)return;
+ const box=scrollport.getBoundingClientRect();
+ customCaret.style.left=(x-box.left-scrollport.clientLeft+scrollport.scrollLeft)+'px';
+ customCaret.style.top=(y-box.top-scrollport.clientTop+scrollport.scrollTop)+'px';
+ customCaret.style.width=w+'px';
+ customCaret.style.display='block';
+}
+function caretTick(){
+ caretFrame=0;drawCaret();
+ if(mode.value==='custom'&&document.activeElement===el)caretFrame=requestAnimationFrame(caretTick);
+}
+function startCaret(){if(!caretFrame)caretTick();}
+function stopCaret(){cancelAnimationFrame(caretFrame);caretFrame=0;customCaret.style.display='none';}
+el.addEventListener('focus',startCaret);
+el.addEventListener('blur',stopCaret);
+el.addEventListener('beforeinput',()=>{customCaret.style.display='none';});
+// These listeners are registered before EditorView; wait until its input
+// or composition handler has finished before reading the final DOM.
+for(const name of ['input','compositionend'])el.addEventListener(name,()=>queueMicrotask(startCaret));
+document.addEventListener('selectionchange',drawCaret);
+let view=null,records=[],until=0,raf=0;
+const sample=Array(40).fill('改行したときのカーソルと画面の動きを確認します。').join('\n');
+function reset(){
+ stopCaret();
+ if(view)view.destroy(); view=null; records=[];
+ document.querySelector('#scroller').className=separated()?'separated editor-scrollport editor-scrollport-vertical':'';
+ el.className=(mode.value==='minimal'?'':'app-style ime-editor')+(mode.value==='custom'?' custom-caret-mode':'');
+ if(mode.value==='app'||separated()) view=new EditorView(el,sample,()=>{});
+ else {el.replaceChildren();for(const line of sample.split('\n')){
+  const block=document.createElement('div');block.className='ed-block';
+  const span=document.createElement('span');span.textContent=line;block.append(span);el.append(block);
+ }}
+ document.querySelector('#status').textContent='比較モード：'+mode.options[mode.selectedIndex].text;
+ startCaret();
+}
+function nodePath(node){const indices=[];while(node&&node!==el){const p=node.parentNode;
+ if(!p)return null;indices.unshift(Array.prototype.indexOf.call(p.childNodes,node));node=p;}
+ return node===el?indices:null;}
+function rect(r){return r?{x:r.x,y:r.y,width:r.width,height:r.height}:null;}
+function capture(event,inputType){
+ if(!document.querySelector('#record').checked)return;
+ const s=getSelection(),range=s&&s.rangeCount?s.getRangeAt(0):null;
+ records.push({t:Math.round(performance.now()*10)/10,event,inputType,
+  scrollLeft:el.scrollLeft,scrollTop:el.scrollTop,width:el.scrollWidth,height:el.scrollHeight,
+  outerScrollLeft:document.querySelector('#scroller').scrollLeft,outerScrollTop:document.querySelector('#scroller').scrollTop,
+  pageX:scrollX,pageY:scrollY,viewport:visualViewport?{x:visualViewport.offsetLeft,y:visualViewport.offsetTop,
+   width:visualViewport.width,height:visualViewport.height,scale:visualViewport.scale}:null,
+  anchor:s?{path:nodePath(s.anchorNode),offset:s.anchorOffset}:null,
+  focus:s?{path:nodePath(s.focusNode),offset:s.focusOffset}:null,
+  caret:range&&el.contains(range.startContainer)?rect(range.getBoundingClientRect()):null,
+  customCaret:mode.value==='custom'&&customCaret.style.display==='block'?rect(customCaret.getBoundingClientRect()):null,
+  box:rect(el.getBoundingClientRect()),blocks:el.childNodes.length});
+ if(records.length>1500)records.shift();
+}
+function frames(){raf=0;capture('frame');if(performance.now()<until)raf=requestAnimationFrame(frames);}
+for(const event of ['beforeinput','input','compositionstart','compositionend','scroll']){
+ el.addEventListener(event,e=>{capture(event,e.inputType);
+  if(document.querySelector('#record').checked&&(event==='input'||event==='compositionend')){
+   until=performance.now()+800;if(!raf)raf=requestAnimationFrame(frames);
+  }});
+}
+document.addEventListener('selectionchange',()=>capture('selectionchange'));
+document.querySelector('#scroller').addEventListener('scroll',()=>capture('outer-scroll'));
+if(visualViewport)for(const event of ['resize','scroll'])visualViewport.addEventListener(event,()=>capture('viewport-'+event));
+mode.addEventListener('change',reset);
+document.querySelector('#end').onclick=()=>{el.focus();const r=document.createRange();
+ r.selectNodeContents(el);r.collapse(false);getSelection().removeAllRanges();getSelection().addRange(r);
+ const scroller=separated()?document.querySelector('#scroller'):el;
+ scroller.scrollLeft=-scroller.scrollWidth;startCaret();};
+document.querySelector('#clear').onclick=()=>{records=[];document.querySelector('#log').value='';};
+document.querySelector('#export').onclick=()=>{document.querySelector('#log').value=JSON.stringify({
+ version:'custom-caret-glyph-fallback-4',userAgent:navigator.userAgent,mode:mode.value,records},null,2);};
+reset();
+</script></html>
